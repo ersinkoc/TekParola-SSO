@@ -15,7 +15,7 @@ export const errorHandler = (
   error: Error,
   req: Request,
   res: Response,
-  next: NextFunction
+  _next: NextFunction
 ): void => {
   logger.error('Error caught by error handler:', {
     message: error.message,

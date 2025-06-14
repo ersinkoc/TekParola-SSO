@@ -34,6 +34,18 @@ export class AuthorizationError extends AppError {
   }
 }
 
+export class UnauthorizedError extends AppError {
+  constructor(message = 'Unauthorized') {
+    super(message, 401, 'UNAUTHORIZED_ERROR');
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = 'Access forbidden') {
+    super(message, 403, 'FORBIDDEN_ERROR');
+  }
+}
+
 export class NotFoundError extends AppError {
   constructor(message = 'Resource not found') {
     super(message, 404, 'NOT_FOUND_ERROR');

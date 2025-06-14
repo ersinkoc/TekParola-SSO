@@ -3,10 +3,34 @@ import { body, param, query } from 'express-validator';
 // Password validation rules
 const passwordValidation = () => {
   return body('password')
-    .isLength({ min: 8 })
-    .withMessage('Password must be at least 8 characters long')
+    .isLength({ min: 8, max: 128 })
+    .withMessage('Password must be between 8 and 128 characters long')
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/)
-    .withMessage('Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character');
+    .withMessage('Password must contain at least one uppercase letter, one lowercase letter, one number, and one special character')
+    .custom((value) => {
+      // Check for common weak passwords
+      const commonPasswords = [
+        'password', 'password123', '123456789', 'qwerty123', 'admin123',
+        'welcome123', 'letmein123', 'monkey123', 'dragon123', 'master123'
+      ];
+      
+      if (commonPasswords.some(common => value.toLowerCase().includes(common.toLowerCase()))) {
+        throw new Error('Password contains common weak patterns');
+      }
+      
+      // Check for repeated characters (more than 3 consecutive)
+      if (/(.)\1{3,}/.test(value)) {
+        throw new Error('Password cannot contain more than 3 consecutive identical characters');
+      }
+      
+      // Check for sequential characters
+      const sequences = ['123456', 'abcdef', 'qwerty', '654321', 'fedcba'];
+      if (sequences.some(seq => value.toLowerCase().includes(seq))) {
+        throw new Error('Password cannot contain sequential character patterns');
+      }
+      
+      return true;
+    });
 };
 
 // Email validation
@@ -110,10 +134,37 @@ export const validateTwoFactorSetup = [
   body('code')
     .notEmpty()
     .withMessage('Verification code is required')
-    .isLength({ min: 6, max: 6 })
-    .withMessage('Verification code must be exactly 6 digits')
-    .isNumeric()
-    .withMessage('Verification code must contain only numbers'),
+    .isLength({ min: 6, max: 8 })
+    .withMessage('Verification code must be 6 digits or 8-character backup code')
+    .custom((value) => {
+      // Allow either 6-digit TOTP or 8-character backup code
+      if (/^\d{6}$/.test(value)) {
+        return true; // Valid TOTP code
+      }
+      if (/^[A-Z0-9]{8}$/.test(value.toUpperCase())) {
+        return true; // Valid backup code format
+      }
+      throw new Error('Code must be either a 6-digit number or 8-character backup code');
+    }),
+];
+
+// Backup code regeneration validation
+export const validateBackupCodeRegeneration = [
+  body('code')
+    .notEmpty()
+    .withMessage('Verification code is required')
+    .isLength({ min: 6, max: 8 })
+    .withMessage('Verification code must be 6 digits or 8-character backup code')
+    .custom((value) => {
+      // Allow either 6-digit TOTP or 8-character backup code
+      if (/^\d{6}$/.test(value)) {
+        return true; // Valid TOTP code
+      }
+      if (/^[A-Z0-9]{8}$/.test(value.toUpperCase())) {
+        return true; // Valid backup code format
+      }
+      throw new Error('Code must be either a 6-digit number or 8-character backup code');
+    }),
 ];
 
 // Change password validation
@@ -122,10 +173,37 @@ export const validateChangePassword = [
     .notEmpty()
     .withMessage('Current password is required'),
   body('newPassword')
-    .isLength({ min: 8 })
-    .withMessage('New password must be at least 8 characters long')
+    .isLength({ min: 8, max: 128 })
+    .withMessage('New password must be between 8 and 128 characters long')
     .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/)
-    .withMessage('New password must contain at least one uppercase letter, one lowercase letter, one number, and one special character'),
+    .withMessage('New password must contain at least one uppercase letter, one lowercase letter, one number, and one special character')
+    .custom((value, { req }) => {
+      // Check if new password is different from current password
+      if (value === req.body.currentPassword) {
+        throw new Error('New password must be different from current password');
+      }
+      
+      // Apply same complexity rules as registration
+      const commonPasswords = [
+        'password', 'password123', '123456789', 'qwerty123', 'admin123',
+        'welcome123', 'letmein123', 'monkey123', 'dragon123', 'master123'
+      ];
+      
+      if (commonPasswords.some(common => value.toLowerCase().includes(common.toLowerCase()))) {
+        throw new Error('Password contains common weak patterns');
+      }
+      
+      if (/(.)\1{3,}/.test(value)) {
+        throw new Error('Password cannot contain more than 3 consecutive identical characters');
+      }
+      
+      const sequences = ['123456', 'abcdef', 'qwerty', '654321', 'fedcba'];
+      if (sequences.some(seq => value.toLowerCase().includes(seq))) {
+        throw new Error('Password cannot contain sequential character patterns');
+      }
+      
+      return true;
+    }),
   body('confirmPassword')
     .custom((value, { req }) => {
       if (value !== req.body.newPassword) {

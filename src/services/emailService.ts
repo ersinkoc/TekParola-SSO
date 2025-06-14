@@ -3,6 +3,8 @@ import { prisma } from '../config/database';
 import { config } from '../config/env';
 import { logger } from '../utils/logger';
 import { EmailError } from '../utils/errors';
+import { emailTemplateService } from './emailTemplateService';
+import { circuitBreakerRegistry } from '../utils/circuitBreaker';
 
 export interface EmailData {
   to: string;
@@ -10,6 +12,7 @@ export interface EmailData {
   htmlContent?: string;
   textContent?: string;
   templateId?: string;
+  templateName?: string;
   templateData?: Record<string, any>;
 }
 
@@ -24,6 +27,7 @@ export interface EmailTemplate {
 
 export class EmailService {
   private transporter: nodemailer.Transporter;
+  private circuitBreaker;
 
   constructor() {
     this.transporter = nodemailer.createTransport({
@@ -35,6 +39,21 @@ export class EmailService {
         pass: config.email.smtp.pass,
       },
     });
+
+    // Initialize circuit breaker for email service
+    this.circuitBreaker = circuitBreakerRegistry.getCircuitBreaker('email_smtp', {
+      failureThreshold: 3,
+      successThreshold: 2,
+      timeout: 30000, // 30 seconds
+      resetTimeout: 120000, // 2 minutes
+      monitoringWindow: 300000, // 5 minutes
+      onStateChange: (state, _serviceName) => {
+        logger.warn(`Email service circuit breaker state changed to: ${state}`);
+      },
+      onFailure: (error, _serviceName) => {
+        logger.error(`Email service failure:`, { error: error.message });
+      },
+    });
   }
 
   async sendEmail(emailData: EmailData): Promise<void> {
@@ -44,12 +63,23 @@ export class EmailService {
       let subject = emailData.subject;
 
       // If template is specified, process it
-      if (emailData.templateId && emailData.templateData) {
-        const template = await this.getTemplate(emailData.templateId);
-        if (template) {
-          htmlContent = this.processTemplate(template.htmlContent, emailData.templateData);
-          textContent = template.textContent ? this.processTemplate(template.textContent, emailData.templateData) : undefined;
-          subject = this.processTemplate(template.subject, emailData.templateData);
+      if ((emailData.templateId || emailData.templateName) && emailData.templateData) {
+        let template = null;
+        
+        if (emailData.templateName) {
+          // Use new template service
+          const rendered = await emailTemplateService.renderTemplate(emailData.templateName, emailData.templateData);
+          htmlContent = rendered.htmlContent;
+          textContent = rendered.textContent;
+          subject = rendered.subject;
+        } else if (emailData.templateId) {
+          // Legacy template system
+          template = await this.getTemplate(emailData.templateId);
+          if (template) {
+            htmlContent = this.processTemplate(template.htmlContent, emailData.templateData);
+            textContent = template.textContent ? this.processTemplate(template.textContent, emailData.templateData) : undefined;
+            subject = this.processTemplate(template.subject, emailData.templateData);
+          }
         }
       }
 
@@ -61,7 +91,11 @@ export class EmailService {
         text: textContent,
       };
 
-      await this.transporter.sendMail(mailOptions);
+      // Use circuit breaker for email sending
+      await this.circuitBreaker.execute(async () => {
+        return await this.transporter.sendMail(mailOptions);
+      });
+      
       logger.info(`Email sent successfully to: ${emailData.to}`);
 
       // Log to email queue with sent status
@@ -304,6 +338,52 @@ export class EmailService {
         <p>Best regards,<br>The ${config.app.companyName} Team</p>
       `,
       textContent: `Two-Factor Authentication\n\nHello ${firstName},\n\nYour two-factor authentication code is: ${code}\n\nThis code will expire in 5 minutes.\n\nIf you didn't request this code, please ignore this email.\n\nBest regards,\nThe ${config.app.companyName} Team`,
+    });
+  }
+
+  async sendTwoFactorBackupCodesEmail(email: string, firstName: string, backupCodes: string[]): Promise<void> {
+    const template = await this.getTemplateByName('two_factor_backup_codes');
+    if (!template) {
+      logger.warn('Two-factor backup codes email template not found, using fallback');
+      
+      // Fallback email if template not found
+      const codesHtml = backupCodes.map(code => `<li><code>${code}</code></li>`).join('');
+      const codesText = backupCodes.map((code, index) => `${index + 1}. ${code}`).join('\n');
+      
+      await this.sendEmail({
+        to: email,
+        subject: 'Two-Factor Authentication Backup Codes',
+        htmlContent: `
+          <h1>Two-Factor Authentication Backup Codes</h1>
+          <p>Hello ${firstName},</p>
+          <p>Your two-factor authentication backup codes have been generated. Please save these codes in a secure location:</p>
+          <ul style="font-family: monospace; list-style-type: none; padding: 20px; background: #f5f5f5; border-radius: 5px;">
+            ${codesHtml}
+          </ul>
+          <p><strong>Important:</strong></p>
+          <ul>
+            <li>Each backup code can only be used once</li>
+            <li>Store these codes in a safe place</li>
+            <li>You can use these codes instead of your authenticator app</li>
+            <li>You can regenerate new codes at any time</li>
+          </ul>
+          <p>If you didn't request these backup codes, please contact our support team immediately.</p>
+          <p>Best regards,<br>The ${config.app.companyName} Security Team</p>
+        `,
+        textContent: `Two-Factor Authentication Backup Codes\n\nHello ${firstName},\n\nYour two-factor authentication backup codes have been generated. Please save these codes in a secure location:\n\n${codesText}\n\nImportant:\n- Each backup code can only be used once\n- Store these codes in a safe place\n- You can use these codes instead of your authenticator app\n- You can regenerate new codes at any time\n\nIf you didn't request these backup codes, please contact our support team immediately.\n\nBest regards,\nThe ${config.app.companyName} Security Team`,
+      });
+      return;
+    }
+
+    await this.sendEmail({
+      to: email,
+      subject: template.subject,
+      templateId: template.id,
+      templateData: {
+        firstName,
+        backupCodes,
+        company_name: config.app.companyName,
+      },
     });
   }
 

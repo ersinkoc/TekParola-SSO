@@ -12,8 +12,91 @@ const envSchema = Joi.object({
   DATABASE_URL: Joi.string().required(),
   
   // JWT
-  JWT_SECRET: Joi.string().required(),
-  JWT_REFRESH_SECRET: Joi.string().required(),
+  JWT_SECRET: Joi.string()
+    .min(32)
+    .required()
+    .custom((value, helpers) => {
+      // Check for weak patterns
+      const weakPatterns = [
+        /^[a-zA-Z]+$/, // Only letters
+        /^[0-9]+$/, // Only numbers
+        /^(.)\1+$/, // Repeated characters
+        /password/i,
+        /secret/i,
+        /key/i,
+        /admin/i,
+        /test/i,
+        /demo/i,
+        /example/i,
+        /sample/i,
+        /change.?this/i,
+        /your.?super.?secret/i
+      ];
+      
+      if (weakPatterns.some(pattern => pattern.test(value))) {
+        return helpers.error('string.weak', { value });
+      }
+      
+      // Check entropy (at least 3 different character types)
+      const hasLower = /[a-z]/.test(value);
+      const hasUpper = /[A-Z]/.test(value);
+      const hasNumber = /[0-9]/.test(value);
+      const hasSpecial = /[^a-zA-Z0-9]/.test(value);
+      const charTypes = [hasLower, hasUpper, hasNumber, hasSpecial].filter(Boolean).length;
+      
+      if (charTypes < 3) {
+        return helpers.error('string.complexity', { value });
+      }
+      
+      return value;
+    })
+    .messages({
+      'string.min': 'JWT_SECRET must be at least 32 characters long',
+      'string.weak': 'JWT_SECRET contains weak patterns. Please use a strong, random secret',
+      'string.complexity': 'JWT_SECRET must contain at least 3 different character types (lowercase, uppercase, numbers, special characters)'
+    }),
+  JWT_REFRESH_SECRET: Joi.string()
+    .min(32)
+    .required()
+    .custom((value, helpers) => {
+      // Same validation as JWT_SECRET
+      const weakPatterns = [
+        /^[a-zA-Z]+$/,
+        /^[0-9]+$/,
+        /^(.)\1+$/,
+        /password/i,
+        /secret/i,
+        /key/i,
+        /admin/i,
+        /test/i,
+        /demo/i,
+        /example/i,
+        /sample/i,
+        /change.?this/i,
+        /your.?super.?secret/i
+      ];
+      
+      if (weakPatterns.some(pattern => pattern.test(value))) {
+        return helpers.error('string.weak', { value });
+      }
+      
+      const hasLower = /[a-z]/.test(value);
+      const hasUpper = /[A-Z]/.test(value);
+      const hasNumber = /[0-9]/.test(value);
+      const hasSpecial = /[^a-zA-Z0-9]/.test(value);
+      const charTypes = [hasLower, hasUpper, hasNumber, hasSpecial].filter(Boolean).length;
+      
+      if (charTypes < 3) {
+        return helpers.error('string.complexity', { value });
+      }
+      
+      return value;
+    })
+    .messages({
+      'string.min': 'JWT_REFRESH_SECRET must be at least 32 characters long',
+      'string.weak': 'JWT_REFRESH_SECRET contains weak patterns. Please use a strong, random secret',
+      'string.complexity': 'JWT_REFRESH_SECRET must contain at least 3 different character types'
+    }),
   JWT_EXPIRES_IN: Joi.string().default('15m'),
   JWT_REFRESH_EXPIRES_IN: Joi.string().default('7d'),
   
@@ -47,7 +130,47 @@ const envSchema = Joi.object({
   ISSUER: Joi.string().default('TekParola'),
   
   // Session
-  SESSION_SECRET: Joi.string().required(),
+  SESSION_SECRET: Joi.string()
+    .min(32)
+    .required()
+    .custom((value, helpers) => {
+      const weakPatterns = [
+        /^[a-zA-Z]+$/,
+        /^[0-9]+$/,
+        /^(.)\1+$/,
+        /password/i,
+        /secret/i,
+        /key/i,
+        /admin/i,
+        /test/i,
+        /demo/i,
+        /example/i,
+        /sample/i,
+        /change.?this/i,
+        /your.?super.?secret/i
+      ];
+      
+      if (weakPatterns.some(pattern => pattern.test(value))) {
+        return helpers.error('string.weak', { value });
+      }
+      
+      const hasLower = /[a-z]/.test(value);
+      const hasUpper = /[A-Z]/.test(value);
+      const hasNumber = /[0-9]/.test(value);
+      const hasSpecial = /[^a-zA-Z0-9]/.test(value);
+      const charTypes = [hasLower, hasUpper, hasNumber, hasSpecial].filter(Boolean).length;
+      
+      if (charTypes < 3) {
+        return helpers.error('string.complexity', { value });
+      }
+      
+      return value;
+    })
+    .messages({
+      'string.min': 'SESSION_SECRET must be at least 32 characters long',
+      'string.weak': 'SESSION_SECRET contains weak patterns. Please use a strong, random secret',
+      'string.complexity': 'SESSION_SECRET must contain at least 3 different character types'
+    }),
   SESSION_TIMEOUT: Joi.number().default(86400000), // 24 hours
   
   // File Upload

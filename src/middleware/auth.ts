@@ -23,6 +23,72 @@ declare global {
   }
 }
 
+export const optionalAuthenticate = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = jwtService.extractTokenFromHeader(authHeader);
+
+    if (!token) {
+      // No token provided - continue without authentication
+      return next();
+    }
+
+    // Verify token
+    const payload = jwtService.verifyAccessToken(token);
+
+    // Check if token is blacklisted
+    const isBlacklisted = await jwtService.isTokenBlacklisted(token);
+    if (isBlacklisted) {
+      // Token is blacklisted - continue without authentication
+      return next();
+    }
+
+    // Check if user tokens are revoked
+    const areTokensRevoked = await jwtService.areUserTokensRevoked(payload.userId);
+    if (areTokensRevoked) {
+      // Tokens revoked - continue without authentication
+      return next();
+    }
+
+    // Find user with roles and permissions
+    const user = await userService.findWithRoles(payload.userId);
+    if (!user || !user.isActive) {
+      // User not found or inactive - continue without authentication
+      return next();
+    }
+
+    // Attach user to request
+    req.user = {
+      id: user.id,
+      email: user.email,
+      firstName: user.firstName,
+      lastName: user.lastName,
+      isActive: user.isActive,
+      isEmailVerified: user.isEmailVerified,
+      roles: (user as any).roles || [],
+      permissions: [],
+    };
+
+    req.sessionId = payload.sessionId;
+
+    // Update session last activity
+    try {
+      await prisma.userSession.update({
+        where: { sessionToken: payload.sessionId },
+        data: { lastActivityAt: new Date() },
+      });
+    } catch (error) {
+      logger.debug('Failed to update session activity:', error);
+    }
+
+    next();
+  } catch (error) {
+    // Authentication failed - continue without authentication
+    logger.debug('Optional authentication failed:', error);
+    next();
+  }
+};
+
 export const authenticate = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   try {
     const authHeader = req.headers.authorization;

@@ -1,9 +1,11 @@
 import bcrypt from 'bcrypt';
+import crypto from 'crypto';
 import { User, Prisma } from '@prisma/client';
 import { prisma } from '../config/database';
 import { config } from '../config/env';
 import { logger } from '../utils/logger';
-import { NotFoundError, ConflictError, ValidationError, AuthenticationError } from '../utils/errors';
+import { NotFoundError, ConflictError, ValidationError } from '../utils/errors';
+import { cacheService } from './cacheService';
 
 export interface CreateUserData {
   email: string;
@@ -30,6 +32,7 @@ export interface UpdateUserData {
 
 export interface UserWithRoles extends User {
   roles: Array<{
+    roleId: string;
     role: {
       id: string;
       name: string;
@@ -105,9 +108,15 @@ export class UserService {
 
   async findById(id: string): Promise<User | null> {
     try {
-      return await prisma.user.findUnique({
-        where: { id },
-      });
+      return await cacheService.getOrSet(
+        cacheService.getCacheKeyConfig('USER_BY_ID')?.pattern.replace('{id}', id) || `user:id:${id}`,
+        async () => {
+          return await prisma.user.findUnique({
+            where: { id },
+          });
+        },
+        { ttl: cacheService.getCacheKeyConfig('USER_BY_ID')?.ttl || 1800 }
+      );
     } catch (error) {
       logger.error('Failed to find user by ID:', error);
       throw error;
@@ -116,9 +125,15 @@ export class UserService {
 
   async findByEmail(email: string): Promise<User | null> {
     try {
-      return await prisma.user.findUnique({
-        where: { email },
-      });
+      return await cacheService.getOrSet(
+        cacheService.getCacheKeyConfig('USER_BY_EMAIL')?.pattern.replace('{email}', email) || `user:email:${email}`,
+        async () => {
+          return await prisma.user.findUnique({
+            where: { email },
+          });
+        },
+        { ttl: cacheService.getCacheKeyConfig('USER_BY_EMAIL')?.ttl || 1800 }
+      );
     } catch (error) {
       logger.error('Failed to find user by email:', error);
       throw error;
@@ -196,6 +211,10 @@ export class UserService {
         },
       });
 
+      // Invalidate user cache
+      await cacheService.invalidateKey('USER_BY_ID', { id });
+      await cacheService.invalidateKey('USER_BY_EMAIL', { email: user.email });
+
       logger.info(`User updated: ${updatedUser.id} (${updatedUser.email})`);
       return updatedUser;
     } catch (error) {
@@ -204,7 +223,7 @@ export class UserService {
     }
   }
 
-  async updatePassword(id: string, newPassword: string, updatedBy?: string): Promise<void> {
+  async updatePassword(id: string, newPassword: string, updatedBy?: string, triggerSecurityEvent = true): Promise<void> {
     try {
       const hashedPassword = await bcrypt.hash(newPassword, config.security.bcryptRounds);
 
@@ -216,6 +235,16 @@ export class UserService {
           updatedAt: new Date(),
         },
       });
+
+      // Invalidate user cache
+      await cacheService.invalidateKey('USER_BY_ID', { id });
+
+      // Trigger security event for password change (if enabled)
+      if (triggerSecurityEvent) {
+        // Import dynamically to avoid circular dependency
+        const { securityEventService } = await import('./securityEventService');
+        await securityEventService.handlePasswordChange(id);
+      }
 
       logger.info(`Password updated for user: ${id}`);
     } catch (error) {
@@ -235,7 +264,7 @@ export class UserService {
 
   async deactivateUser(id: string, updatedBy?: string): Promise<User> {
     try {
-      const user = await this.updateUser(id, { updatedBy });
+      await this.updateUser(id, { updatedBy });
       
       const deactivatedUser = await prisma.user.update({
         where: { id },
@@ -312,7 +341,7 @@ export class UserService {
         });
       } else {
         const user = await this.findById(id);
-        if (!user) return;
+        if (!user) {return;}
 
         const failedAttempts = user.failedLoginAttempts + 1;
         const shouldLock = failedAttempts >= config.security.maxLoginAttempts;
@@ -336,7 +365,7 @@ export class UserService {
   }
 
   async isAccountLocked(user: User): Promise<boolean> {
-    if (!user.lockedUntil) return false;
+    if (!user.lockedUntil) {return false;}
     
     if (user.lockedUntil > new Date()) {
       return true;
@@ -442,6 +471,335 @@ export class UserService {
       logger.error('Failed to get user stats:', error);
       throw error;
     }
+  }
+
+  async findManyWithFilters(
+    where: Prisma.UserWhereInput,
+    options: {
+      skip?: number;
+      take?: number;
+      orderBy?: Prisma.UserOrderByWithRelationInput;
+    } = {}
+  ): Promise<UserWithRoles[]> {
+    try {
+      return await prisma.user.findMany({
+        where,
+        ...options,
+        include: {
+          roles: {
+            include: {
+              role: {
+                include: {
+                  permissions: {
+                    include: {
+                      permission: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+    } catch (error) {
+      logger.error('Failed to find users with filters:', error);
+      throw error;
+    }
+  }
+
+  async countWithFilters(where: Prisma.UserWhereInput): Promise<number> {
+    try {
+      return await prisma.user.count({ where });
+    } catch (error) {
+      logger.error('Failed to count users with filters:', error);
+      throw error;
+    }
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    try {
+      const user = await this.findById(id);
+      if (!user) {
+        throw new NotFoundError('User not found');
+      }
+
+      // Delete user (cascade will handle related records)
+      await prisma.user.delete({
+        where: { id },
+      });
+
+      logger.info(`User deleted: ${id} (${user.email})`);
+    } catch (error) {
+      logger.error('Failed to delete user:', error);
+      throw error;
+    }
+  }
+
+
+  async revokeUserSession(userId: string, sessionId: string): Promise<void> {
+    try {
+      await prisma.userSession.updateMany({
+        where: {
+          userId,
+          sessionToken: sessionId,
+        },
+        data: {
+          isActive: false,
+        },
+      });
+
+      logger.info(`Session revoked: ${sessionId} for user ${userId}`);
+    } catch (error) {
+      logger.error('Failed to revoke user session:', error);
+      throw error;
+    }
+  }
+
+  async revokeAllUserSessions(userId: string): Promise<void> {
+    try {
+      await prisma.userSession.updateMany({
+        where: { userId },
+        data: { isActive: false },
+      });
+
+      logger.info(`All sessions revoked for user: ${userId}`);
+    } catch (error) {
+      logger.error('Failed to revoke all user sessions:', error);
+      throw error;
+    }
+  }
+
+  async createSession(sessionData: {
+    userId: string;
+    applicationId?: string;
+    ipAddress: string;
+    userAgent: string;
+    expiresAt: Date;
+    country?: string;
+    city?: string;
+    device?: string;
+    browser?: string;
+    os?: string;
+  }): Promise<any> {
+    try {
+      const sessionToken = this.generateSessionToken();
+      
+      const session = await prisma.userSession.create({
+        data: {
+          userId: sessionData.userId,
+          applicationId: sessionData.applicationId,
+          sessionToken,
+          ipAddress: sessionData.ipAddress,
+          userAgent: sessionData.userAgent,
+          expiresAt: sessionData.expiresAt,
+          country: sessionData.country,
+          city: sessionData.city,
+          device: sessionData.device,
+          browser: sessionData.browser,
+          os: sessionData.os,
+        },
+      });
+
+      logger.info(`Session created: ${sessionToken} for user ${sessionData.userId}`);
+      return session;
+    } catch (error) {
+      logger.error('Failed to create session:', error);
+      throw error;
+    }
+  }
+
+  async assignRoles(userId: string, roleIds: string[], assignedBy?: string): Promise<void> {
+    try {
+      const user = await this.findWithRoles(userId);
+      if (!user) {
+        throw new NotFoundError('User not found');
+      }
+
+      const oldRoles = user.roles.map(ur => ur.role.name);
+
+      // Remove existing roles
+      await prisma.userRole.deleteMany({
+        where: { userId },
+      });
+
+      // Add new roles
+      const userRoles = roleIds.map(roleId => ({
+        userId,
+        roleId,
+        assignedBy,
+      }));
+
+      await prisma.userRole.createMany({
+        data: userRoles,
+      });
+
+      // Get new role names for security event
+      const newRoles = await prisma.role.findMany({
+        where: { id: { in: roleIds } },
+        select: { name: true },
+      });
+      const newRoleNames = newRoles.map(r => r.name);
+
+      // Trigger security event for role changes
+      if (oldRoles.length > 0 || newRoleNames.length > 0) {
+        const { securityEventService } = await import('./securityEventService');
+        await securityEventService.handleRoleChange(userId, oldRoles, newRoleNames);
+      }
+
+      logger.info(`Roles updated for user ${userId}: ${oldRoles.join(', ')} -> ${newRoleNames.join(', ')}`);
+    } catch (error) {
+      logger.error('Failed to assign roles:', error);
+      throw error;
+    }
+  }
+
+  async addRole(userId: string, roleId: string, assignedBy?: string): Promise<void> {
+    try {
+      const user = await this.findWithRoles(userId);
+      if (!user) {
+        throw new NotFoundError('User not found');
+      }
+
+      const existingRole = user.roles.find(ur => ur.roleId === roleId);
+      if (existingRole) {
+        throw new ConflictError('User already has this role');
+      }
+
+      await prisma.userRole.create({
+        data: {
+          userId,
+          roleId,
+          assignedBy,
+        },
+      });
+
+      // Get role name for logging
+      const role = await prisma.role.findUnique({
+        where: { id: roleId },
+        select: { name: true },
+      });
+
+      const oldRoles = user.roles.map(ur => ur.role.name);
+      const newRoles = [...oldRoles, role?.name || 'unknown'];
+
+      // Trigger security event for role addition
+      const { securityEventService } = await import('./securityEventService');
+      await securityEventService.handleRoleChange(userId, oldRoles, newRoles);
+
+      logger.info(`Role ${role?.name} added to user ${userId}`);
+    } catch (error) {
+      logger.error('Failed to add role:', error);
+      throw error;
+    }
+  }
+
+  async removeRole(userId: string, roleId: string): Promise<void> {
+    try {
+      const user = await this.findWithRoles(userId);
+      if (!user) {
+        throw new NotFoundError('User not found');
+      }
+
+      const existingRole = user.roles.find(ur => ur.roleId === roleId);
+      if (!existingRole) {
+        throw new NotFoundError('User does not have this role');
+      }
+
+      await prisma.userRole.delete({
+        where: {
+          userId_roleId: {
+            userId,
+            roleId,
+          },
+        },
+      });
+
+      // Get role name for logging
+      const role = await prisma.role.findUnique({
+        where: { id: roleId },
+        select: { name: true },
+      });
+
+      const oldRoles = user.roles.map(ur => ur.role.name);
+      const newRoles = oldRoles.filter(roleName => roleName !== role?.name);
+
+      // Trigger security event for role removal
+      const { securityEventService } = await import('./securityEventService');
+      await securityEventService.handleRoleChange(userId, oldRoles, newRoles);
+
+      logger.info(`Role ${role?.name} removed from user ${userId}`);
+    } catch (error) {
+      logger.error('Failed to remove role:', error);
+      throw error;
+    }
+  }
+
+  async updateEmail(userId: string, newEmail: string, updatedBy?: string): Promise<User> {
+    try {
+      const user = await this.findById(userId);
+      if (!user) {
+        throw new NotFoundError('User not found');
+      }
+
+      const oldEmail = user.email;
+
+      // Check if email already exists
+      const existingUser = await this.findByEmail(newEmail);
+      if (existingUser && existingUser.id !== userId) {
+        throw new ConflictError('Email already in use');
+      }
+
+      const updatedUser = await prisma.user.update({
+        where: { id: userId },
+        data: {
+          email: newEmail,
+          isEmailVerified: false, // Reset email verification
+          emailVerifiedAt: null,
+          updatedBy,
+          updatedAt: new Date(),
+        },
+      });
+
+      // Trigger security event for email change
+      const { securityEventService } = await import('./securityEventService');
+      await securityEventService.handleEmailChange(userId, oldEmail, newEmail);
+
+      logger.info(`Email updated for user ${userId}: ${oldEmail} -> ${newEmail}`);
+      return updatedUser;
+    } catch (error) {
+      logger.error('Failed to update email:', error);
+      throw error;
+    }
+  }
+
+  async getUserSessions(userId: string, options: { activeOnly?: boolean; limit?: number } = {}): Promise<any[]> {
+    try {
+      const { activeOnly = false, limit } = options;
+      
+      const whereClause: any = { userId };
+      
+      if (activeOnly) {
+        whereClause.isActive = true;
+        whereClause.expiresAt = {
+          gt: new Date(),
+        };
+      }
+
+      const sessions = await prisma.userSession.findMany({
+        where: whereClause,
+        orderBy: { createdAt: 'desc' },
+        take: limit,
+      });
+
+      return sessions;
+    } catch (error) {
+      logger.error('Failed to get user sessions:', error);
+      throw error;
+    }
+  }
+
+  private generateSessionToken(): string {
+    return crypto.randomBytes(32).toString('hex');
   }
 }
 

@@ -1,7 +1,6 @@
 import { Request, Response } from 'express';
 import { authService } from '../services/authService';
 import { userService } from '../services/userService';
-import { logger } from '../utils/logger';
 import { asyncHandler } from '../middleware/errorHandler';
 import { AuthenticationError, ValidationError } from '../utils/errors';
 
@@ -262,11 +261,37 @@ export class AuthController {
     const userId = req.user!.id;
     const { code } = req.body;
 
-    await authService.enableTwoFactor(userId, code);
+    const result = await authService.enableTwoFactor(userId, code);
 
     res.status(200).json({
       success: true,
       message: 'Two-factor authentication enabled successfully',
+      data: {
+        backupCodes: result.backupCodes,
+      },
+    });
+  });
+
+  verify2FA = asyncHandler(async (req: Request, res: Response) => {
+    const { email, code } = req.body;
+    const ipAddress = req.ip || req.connection.remoteAddress || 'unknown';
+    const userAgent = req.get('User-Agent') || 'unknown';
+
+    const result = await authService.verifyTwoFactorForLogin(
+      email,
+      code,
+      ipAddress,
+      userAgent
+    );
+
+    res.status(200).json({
+      success: true,
+      message: 'Two-factor authentication verified successfully',
+      data: {
+        accessToken: result.accessToken,
+        refreshToken: result.refreshToken,
+        user: result.user,
+      },
     });
   });
 
@@ -279,6 +304,33 @@ export class AuthController {
     res.status(200).json({
       success: true,
       message: 'Two-factor authentication disabled successfully',
+    });
+  });
+
+  regenerateBackupCodes = asyncHandler(async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+    const { code } = req.body;
+
+    const backupCodes = await authService.regenerateBackupCodes(userId, code);
+
+    res.status(200).json({
+      success: true,
+      message: 'Backup codes regenerated successfully',
+      data: {
+        backupCodes,
+      },
+    });
+  });
+
+  getBackupCodesInfo = asyncHandler(async (req: Request, res: Response) => {
+    const userId = req.user!.id;
+
+    const info = await authService.getBackupCodesInfo(userId);
+
+    res.status(200).json({
+      success: true,
+      message: 'Backup codes info retrieved successfully',
+      data: info,
     });
   });
 

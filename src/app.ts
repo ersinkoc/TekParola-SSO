@@ -2,14 +2,35 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
+import swaggerUi from 'swagger-ui-express';
 import { config } from './config/env';
+import { swaggerSpec } from './config/swagger';
 import { connectRedis } from './config/redis';
 import { logger } from './utils/logger';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
 import { generalLimiter } from './middleware/rateLimiter';
+import { createRequestLogger } from './utils/logger';
+import { csrfProtection, csrfTokenGenerator } from './middleware/csrf';
+import { sanitizeInput } from './middleware/sanitizer';
+import cookieParser from 'cookie-parser';
 
 // Import routes
 import authRoutes from './routes/authRoutes';
+import userRoutes from './routes/userRoutes';
+import userBulkRoutes from './routes/userBulkRoutes';
+import adminRoutes from './routes/adminRoutes';
+import applicationRoutes from './routes/applicationRoutes';
+import sessionRoutes from './routes/sessionRoutes';
+import settingsRoutes from './routes/settingsRoutes';
+import emailTemplateRoutes from './routes/emailTemplateRoutes';
+import dashboardRoutes from './routes/dashboardRoutes';
+import auditRoutes from './routes/auditRoutes';
+import roleRoutes from './routes/roleRoutes';
+import securityRoutes from './routes/securityRoutes';
+import ssoRoutes from './routes/ssoRoutes';
+import apiRoutes from './routes/apiRoutes';
+import healthRoutes from './routes/healthRoutes';
+import metricsRoutes from './routes/metricsRoutes';
 
 export const createApp = (): express.Application => {
   const app = express();
@@ -22,22 +43,56 @@ export const createApp = (): express.Application => {
         styleSrc: ["'self'", "'unsafe-inline'"],
         scriptSrc: ["'self'"],
         imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'"],
+        frameSrc: ["'none'"],
       },
     },
+    crossOriginEmbedderPolicy: true,
+    crossOriginOpenerPolicy: true,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+    dnsPrefetchControl: true,
+    frameguard: { action: 'deny' },
     hsts: {
       maxAge: 31536000,
       includeSubDomains: true,
       preload: true,
     },
+    ieNoOpen: true,
+    noSniff: true,
+    originAgentCluster: true,
+    permittedCrossDomainPolicies: false,
+    referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+    xssFilter: true,
   }));
 
   // CORS configuration
   app.use(cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (mobile apps, curl, etc.)
+      // In production, always validate origins
+      if (config.node_env === 'production') {
+        if (!origin) {
+          return callback(new Error('Origin header required in production'));
+        }
+        
+        const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [];
+        
+        if (allowedOrigins.length === 0) {
+          return callback(new Error('No allowed origins configured'));
+        }
+        
+        if (!allowedOrigins.includes(origin)) {
+          return callback(new Error(`Origin ${origin} not allowed by CORS`));
+        }
+        
+        return callback(null, true);
+      }
+      
+      // In development, allow common localhost origins
       if (!origin) return callback(null, true);
       
-      // In production, configure allowed origins
       const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [
         'http://localhost:3000',
         'http://localhost:3001',
@@ -49,11 +104,14 @@ export const createApp = (): express.Application => {
         return callback(null, true);
       }
       
-      callback(new Error('Not allowed by CORS'));
+      callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token'],
+    exposedHeaders: ['X-CSRF-Token'],
+    maxAge: 86400, // 24 hours
+    optionsSuccessStatus: 200,
   }));
 
   // Compression middleware
@@ -62,33 +120,51 @@ export const createApp = (): express.Application => {
   // Body parsing middleware
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+  
+  // Cookie parser (required for CSRF)
+  app.use(cookieParser());
+  
+  // Input sanitization (before other middleware)
+  app.use(sanitizeInput());
+
+  // CSRF protection
+  app.use(csrfTokenGenerator());
+  app.use(csrfProtection());
 
   // Rate limiting
   app.use(generalLimiter);
 
-  // Request logging
-  app.use((req, res, next) => {
-    logger.info(`${req.method} ${req.url}`, {
-      ip: req.ip,
-      userAgent: req.get('User-Agent'),
-      userId: (req as any).user?.id,
-    });
-    next();
-  });
+  // Request logging middleware
+  app.use(createRequestLogger());
 
-  // Health check endpoint
-  app.get('/health', (req, res) => {
-    res.status(200).json({
-      success: true,
-      message: 'Service is healthy',
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      environment: config.node_env,
-    });
-  });
+  // Health check endpoints
+  app.use('/health', healthRoutes);
+
+  // Metrics endpoints  
+  app.use('/metrics', metricsRoutes);
+
+  // Swagger documentation
+  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+    explorer: true,
+    customCss: '.swagger-ui .topbar { display: none }',
+    customSiteTitle: 'TekParola SSO API Documentation',
+  }));
 
   // API routes
   app.use(`/api/${config.api_version}/auth`, authRoutes);
+  app.use(`/api/${config.api_version}/users`, userRoutes);
+  app.use(`/api/${config.api_version}/users/bulk`, userBulkRoutes);
+  app.use(`/api/${config.api_version}/admin`, adminRoutes);
+  app.use(`/api/${config.api_version}/applications`, applicationRoutes);
+  app.use(`/api/${config.api_version}/sessions`, sessionRoutes);
+  app.use(`/api/${config.api_version}/settings`, settingsRoutes);
+  app.use(`/api/${config.api_version}/email-templates`, emailTemplateRoutes);
+  app.use(`/api/${config.api_version}/dashboard`, dashboardRoutes);
+  app.use(`/api/${config.api_version}/audit`, auditRoutes);
+  app.use(`/api/${config.api_version}/roles`, roleRoutes);
+  app.use(`/api/${config.api_version}/security`, securityRoutes);
+  app.use('/sso', ssoRoutes);
+  app.use('/api/external', apiRoutes);
 
   // API documentation endpoint
   app.get('/api', (req, res) => {
@@ -101,10 +177,18 @@ export const createApp = (): express.Application => {
       endpoints: {
         auth: `/api/${config.api_version}/auth`,
         users: `/api/${config.api_version}/users`,
-        roles: `/api/${config.api_version}/roles`,
-        permissions: `/api/${config.api_version}/permissions`,
-        applications: `/api/${config.api_version}/applications`,
+        usersBulk: `/api/${config.api_version}/users/bulk`,
         admin: `/api/${config.api_version}/admin`,
+        applications: `/api/${config.api_version}/applications`,
+        sessions: `/api/${config.api_version}/sessions`,
+        settings: `/api/${config.api_version}/settings`,
+        emailTemplates: `/api/${config.api_version}/email-templates`,
+        dashboard: `/api/${config.api_version}/dashboard`,
+        audit: `/api/${config.api_version}/audit`,
+        roles: `/api/${config.api_version}/roles`,
+        security: `/api/${config.api_version}/security`,
+        sso: '/sso',
+        external: '/api/external',
       },
     });
   });
@@ -123,6 +207,21 @@ export const startServer = async (): Promise<void> => {
     // Connect to Redis
     await connectRedis();
     logger.info('Connected to Redis');
+
+    // Start key rotation scheduler
+    const { keyRotationService } = await import('./services/keyRotationService');
+    keyRotationService.start();
+    logger.info('Key rotation scheduler started');
+
+    // Start database maintenance scheduler
+    const { databaseMaintenanceService } = await import('./services/databaseMaintenanceService');
+    databaseMaintenanceService.start();
+    logger.info('Database maintenance scheduler started');
+
+    // Start monitoring service
+    const { monitoringService } = await import('./services/monitoringService');
+    monitoringService.start();
+    logger.info('Monitoring service started');
 
     // Create Express app
     const app = createApp();
@@ -143,6 +242,21 @@ export const startServer = async (): Promise<void> => {
         
         // Close database connections and other cleanup
         try {
+          // Stop key rotation scheduler
+          const { keyRotationService } = await import('./services/keyRotationService');
+          keyRotationService.stop();
+          logger.info('Key rotation scheduler stopped');
+
+          // Stop database maintenance scheduler
+          const { databaseMaintenanceService } = await import('./services/databaseMaintenanceService');
+          databaseMaintenanceService.stop();
+          logger.info('Database maintenance scheduler stopped');
+
+          // Stop monitoring service
+          const { monitoringService } = await import('./services/monitoringService');
+          monitoringService.stop();
+          logger.info('Monitoring service stopped');
+          
           const { disconnectRedis } = await import('./config/redis');
           await disconnectRedis();
           logger.info('Redis connection closed');
