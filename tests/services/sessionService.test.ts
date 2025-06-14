@@ -1,17 +1,14 @@
 import { sessionService } from '../../src/services/sessionService';
 import { prisma } from '../../src/config/database';
-import { redis } from '../../src/config/redis';
-import { AuthenticationError, ValidationError } from '../../src/utils/errors';
-import * as jwt from 'jsonwebtoken';
+import { redisClient } from '../../src/config/redis';
+import { ValidationError } from '../../src/utils/errors';
 
 // Mock dependencies
 jest.mock('../../src/config/database');
 jest.mock('../../src/config/redis');
-jest.mock('jsonwebtoken');
 
 const mockPrisma = prisma as jest.Mocked<typeof prisma>;
-const mockRedis = redis as jest.Mocked<typeof redis>;
-const mockJwt = jwt as jest.Mocked<typeof jwt>;
+const mockRedis = redisClient as jest.Mocked<typeof redisClient>;
 
 describe('SessionService', () => {
   beforeEach(() => {
@@ -30,31 +27,46 @@ describe('SessionService', () => {
       const mockSession = {
         id: 'session-123',
         userId: sessionData.userId,
+        applicationId: null,
+        sessionToken: 'generated-session-token',
+        refreshToken: 'generated-refresh-token',
         ipAddress: sessionData.ipAddress,
         userAgent: sessionData.userAgent,
         isActive: true,
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-        createdAt: new Date(),
         lastActivityAt: new Date(),
+        country: null,
+        city: null,
+        device: null,
+        browser: null,
+        os: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
-      mockPrisma.session.create.mockResolvedValue(mockSession as any);
-      mockRedis.setex.mockResolvedValue('OK');
+      mockPrisma.userSession.create.mockResolvedValue(mockSession as any);
+      mockRedis.setEx.mockResolvedValue('OK');
 
       const result = await sessionService.createSession(sessionData);
 
       expect(result).toEqual(mockSession);
-      expect(mockPrisma.session.create).toHaveBeenCalledWith({
+      expect(mockPrisma.userSession.create).toHaveBeenCalledWith({
         data: {
           userId: sessionData.userId,
+          applicationId: undefined,
+          sessionToken: expect.any(String),
+          refreshToken: expect.any(String),
           ipAddress: sessionData.ipAddress,
           userAgent: sessionData.userAgent,
-          isActive: true,
           expiresAt: expect.any(Date),
-          lastActivityAt: expect.any(Date),
+          country: undefined,
+          city: undefined,
+          device: undefined,
+          browser: undefined,
+          os: undefined,
         },
       });
-      expect(mockRedis.setex).toHaveBeenCalled();
+      expect(mockRedis.setEx).toHaveBeenCalled();
     });
 
     it('should create extended session when remember is true', async () => {
@@ -62,254 +74,238 @@ describe('SessionService', () => {
       const mockSession = {
         id: 'session-123',
         userId: sessionData.userId,
+        applicationId: null,
+        sessionToken: 'generated-session-token',
+        refreshToken: 'generated-refresh-token',
         ipAddress: sessionData.ipAddress,
         userAgent: sessionData.userAgent,
         isActive: true,
         expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
-        createdAt: new Date(),
         lastActivityAt: new Date(),
+        country: null,
+        city: null,
+        device: null,
+        browser: null,
+        os: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
       };
 
-      mockPrisma.session.create.mockResolvedValue(mockSession as any);
-      mockRedis.setex.mockResolvedValue('OK');
+      mockPrisma.userSession.create.mockResolvedValue(mockSession as any);
+      mockRedis.setEx.mockResolvedValue('OK');
 
       const result = await sessionService.createSession(rememberSessionData);
 
       expect(result).toEqual(mockSession);
       // Expect longer expiration time for remember sessions
-      const createCall = mockPrisma.session.create.mock.calls[0][0];
+      const createCall = mockPrisma.userSession.create.mock.calls[0][0];
       const expiresAt = createCall.data.expiresAt as Date;
       const expectedMinTime = Date.now() + 25 * 24 * 60 * 60 * 1000; // At least 25 days
       expect(expiresAt.getTime()).toBeGreaterThan(expectedMinTime);
     });
+
+    it('should handle database error', async () => {
+      mockPrisma.userSession.create.mockRejectedValue(new Error('Database error'));
+
+      await expect(sessionService.createSession(sessionData)).rejects.toThrow(ValidationError);
+    });
   });
 
-  describe('findById', () => {
-    it('should find session by id', async () => {
-      const sessionId = 'session-123';
-      const mockSession = {
-        id: sessionId,
+  describe('getSession', () => {
+    it('should get session from cache first', async () => {
+      const sessionToken = 'valid-session-token';
+      const cachedData = JSON.stringify({
+        id: 'session-123',
         userId: 'user-123',
+        applicationId: null,
+        isActive: true,
+      });
+
+      const mockSession = {
+        id: 'session-123',
+        userId: 'user-123',
+        sessionToken,
         isActive: true,
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
       };
 
-      mockPrisma.session.findUnique.mockResolvedValue(mockSession as any);
+      mockRedis.get.mockResolvedValue(cachedData);
+      mockPrisma.userSession.findUnique.mockResolvedValue(mockSession as any);
 
-      const result = await sessionService.findById(sessionId);
+      const result = await sessionService.getSession(sessionToken);
 
       expect(result).toEqual(mockSession);
-      expect(mockPrisma.session.findUnique).toHaveBeenCalledWith({
-        where: { id: sessionId },
+      expect(mockRedis.get).toHaveBeenCalledWith(`session:${sessionToken}`);
+      expect(mockPrisma.userSession.findUnique).toHaveBeenCalledWith({
+        where: {
+          sessionToken,
+          isActive: true,
+          expiresAt: {
+            gt: expect.any(Date),
+          },
+        },
       });
     });
 
-    it('should return null for non-existent session', async () => {
-      const sessionId = 'non-existent';
-      mockPrisma.session.findUnique.mockResolvedValue(null);
+    it('should return null for expired session', async () => {
+      const sessionToken = 'expired-session-token';
+      mockRedis.get.mockResolvedValue(null);
+      mockPrisma.userSession.findUnique.mockResolvedValue(null);
 
-      const result = await sessionService.findById(sessionId);
+      const result = await sessionService.getSession(sessionToken);
 
       expect(result).toBeNull();
     });
+
+    it('should handle cache miss and get from database', async () => {
+      const sessionToken = 'valid-session-token';
+      const mockSession = {
+        id: 'session-123',
+        userId: 'user-123',
+        sessionToken,
+        isActive: true,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+      };
+
+      mockRedis.get.mockResolvedValue(null);
+      mockPrisma.userSession.findUnique.mockResolvedValue(mockSession as any);
+
+      const result = await sessionService.getSession(sessionToken);
+
+      expect(result).toEqual(mockSession);
+    });
   });
 
-  describe('validateSession', () => {
-    it('should validate active session successfully', async () => {
-      const sessionId = 'session-123';
+  describe('updateSessionActivity', () => {
+    it('should update session activity successfully', async () => {
+      const sessionToken = 'valid-session-token';
       const mockSession = {
-        id: sessionId,
+        id: 'session-123',
         userId: 'user-123',
+        sessionToken,
         isActive: true,
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
         lastActivityAt: new Date(),
       };
 
-      mockPrisma.session.findUnique.mockResolvedValue(mockSession as any);
-      mockPrisma.session.update.mockResolvedValue(mockSession as any);
-      mockRedis.setex.mockResolvedValue('OK');
+      const updatedSession = {
+        ...mockSession,
+        lastActivityAt: new Date(),
+      };
 
-      const result = await sessionService.validateSession(sessionId);
-
-      expect(result).toEqual(mockSession);
-      expect(mockPrisma.session.update).toHaveBeenCalledWith({
-        where: { id: sessionId },
-        data: { lastActivityAt: expect.any(Date) },
-      });
-    });
-
-    it('should return null for expired session', async () => {
-      const sessionId = 'session-123';
-      const expiredSession = {
-        id: sessionId,
-        userId: 'user-123',
+      mockRedis.get.mockResolvedValue(JSON.stringify({
+        id: mockSession.id,
+        userId: mockSession.userId,
+        applicationId: null,
         isActive: true,
-        expiresAt: new Date(Date.now() - 60 * 60 * 1000), // Expired 1 hour ago
-      };
+      }));
+      mockPrisma.userSession.findUnique.mockResolvedValue(mockSession as any);
+      mockPrisma.userSession.update.mockResolvedValue(updatedSession as any);
+      mockRedis.setEx.mockResolvedValue('OK');
 
-      mockPrisma.session.findUnique.mockResolvedValue(expiredSession as any);
+      const result = await sessionService.updateSessionActivity(sessionToken);
 
-      const result = await sessionService.validateSession(sessionId);
-
-      expect(result).toBeNull();
-      expect(mockPrisma.session.update).not.toHaveBeenCalled();
-    });
-
-    it('should return null for inactive session', async () => {
-      const sessionId = 'session-123';
-      const inactiveSession = {
-        id: sessionId,
-        userId: 'user-123',
-        isActive: false,
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      };
-
-      mockPrisma.session.findUnique.mockResolvedValue(inactiveSession as any);
-
-      const result = await sessionService.validateSession(sessionId);
-
-      expect(result).toBeNull();
-    });
-  });
-
-  describe('generateTokens', () => {
-    it('should generate access and refresh tokens', async () => {
-      const sessionData = {
-        sessionId: 'session-123',
-        userId: 'user-123',
-        roles: ['user'],
-        permissions: ['read:profile'],
-      };
-
-      const mockAccessToken = 'mock-access-token';
-      const mockRefreshToken = 'mock-refresh-token';
-
-      mockJwt.sign
-        .mockReturnValueOnce(mockAccessToken) // Access token
-        .mockReturnValueOnce(mockRefreshToken); // Refresh token
-
-      mockRedis.setex.mockResolvedValue('OK');
-
-      const result = await sessionService.generateTokens(sessionData);
-
-      expect(result).toEqual({
-        accessToken: mockAccessToken,
-        refreshToken: mockRefreshToken,
+      expect(result).toEqual(updatedSession);
+      expect(mockPrisma.userSession.update).toHaveBeenCalledWith({
+        where: { id: mockSession.id },
+        data: {
+          lastActivityAt: expect.any(Date),
+        },
       });
-
-      expect(mockJwt.sign).toHaveBeenCalledTimes(2);
-      expect(mockRedis.setex).toHaveBeenCalledWith(
-        `refresh_token:${sessionData.sessionId}`,
-        expect.any(Number),
-        mockRefreshToken
-      );
-    });
-  });
-
-  describe('validateRefreshToken', () => {
-    it('should validate refresh token successfully', async () => {
-      const refreshToken = 'valid-refresh-token';
-      const sessionId = 'session-123';
-      const mockSession = {
-        id: sessionId,
-        userId: 'user-123',
-        isActive: true,
-        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-      };
-
-      const mockDecoded = {
-        sessionId,
-        userId: 'user-123',
-        type: 'refresh',
-      };
-
-      mockJwt.verify.mockReturnValue(mockDecoded as any);
-      mockRedis.get.mockResolvedValue(refreshToken);
-      mockPrisma.session.findUnique.mockResolvedValue(mockSession as any);
-
-      const result = await sessionService.validateRefreshToken(refreshToken);
-
-      expect(result).toEqual(mockSession);
-      expect(mockJwt.verify).toHaveBeenCalledWith(
-        refreshToken,
-        process.env.JWT_REFRESH_SECRET
-      );
-      expect(mockRedis.get).toHaveBeenCalledWith(`refresh_token:${sessionId}`);
     });
 
-    it('should return null for invalid token signature', async () => {
-      const invalidToken = 'invalid-token';
-      mockJwt.verify.mockImplementation(() => {
-        throw new Error('Invalid signature');
-      });
+    it('should return null for non-existent session', async () => {
+      const sessionToken = 'invalid-session-token';
+      mockRedis.get.mockResolvedValue(null);
+      mockPrisma.userSession.findUnique.mockResolvedValue(null);
 
-      const result = await sessionService.validateRefreshToken(invalidToken);
+      const result = await sessionService.updateSessionActivity(sessionToken);
 
       expect(result).toBeNull();
-      expect(mockRedis.get).not.toHaveBeenCalled();
-    });
-
-    it('should return null for token not in Redis', async () => {
-      const refreshToken = 'valid-but-revoked-token';
-      const sessionId = 'session-123';
-      const mockDecoded = {
-        sessionId,
-        userId: 'user-123',
-        type: 'refresh',
-      };
-
-      mockJwt.verify.mockReturnValue(mockDecoded as any);
-      mockRedis.get.mockResolvedValue(null); // Token not in Redis
-
-      const result = await sessionService.validateRefreshToken(refreshToken);
-
-      expect(result).toBeNull();
-      expect(mockPrisma.session.findUnique).not.toHaveBeenCalled();
     });
   });
 
   describe('invalidateSession', () => {
     it('should invalidate session successfully', async () => {
-      const sessionId = 'session-123';
-      mockPrisma.session.update.mockResolvedValue({} as any);
+      const sessionToken = 'valid-session-token';
+      const mockSession = {
+        id: 'session-123',
+        userId: 'user-123',
+        sessionToken,
+        isActive: true,
+      };
+
+      mockPrisma.userSession.findUnique.mockResolvedValue(mockSession as any);
+      mockPrisma.userSession.update.mockResolvedValue({
+        ...mockSession,
+        isActive: false,
+      } as any);
       mockRedis.del.mockResolvedValue(1);
 
-      await sessionService.invalidateSession(sessionId);
+      const result = await sessionService.invalidateSession(sessionToken);
 
-      expect(mockPrisma.session.update).toHaveBeenCalledWith({
-        where: { id: sessionId },
+      expect(result).toBe(true);
+      expect(mockPrisma.userSession.update).toHaveBeenCalledWith({
+        where: { id: mockSession.id },
         data: { isActive: false },
       });
-      expect(mockRedis.del).toHaveBeenCalledWith(`refresh_token:${sessionId}`);
+      expect(mockRedis.del).toHaveBeenCalledWith(`session:${sessionToken}`);
+    });
+
+    it('should return false for non-existent session', async () => {
+      const sessionToken = 'invalid-session-token';
+      mockPrisma.userSession.findUnique.mockResolvedValue(null);
+
+      const result = await sessionService.invalidateSession(sessionToken);
+
+      expect(result).toBe(false);
     });
   });
 
-  describe('invalidateAllUserSessions', () => {
+  describe('invalidateUserSessions', () => {
     it('should invalidate all user sessions', async () => {
       const userId = 'user-123';
       const mockSessions = [
-        { id: 'session-1', userId },
-        { id: 'session-2', userId },
+        { sessionToken: 'session-1' },
+        { sessionToken: 'session-2' },
       ];
 
-      mockPrisma.session.findMany.mockResolvedValue(mockSessions as any);
-      mockPrisma.session.updateMany.mockResolvedValue({ count: 2 });
+      mockPrisma.userSession.findMany.mockResolvedValue(mockSessions as any);
+      mockPrisma.userSession.updateMany.mockResolvedValue({ count: 2 });
       mockRedis.del.mockResolvedValue(2);
 
-      await sessionService.invalidateAllUserSessions(userId);
+      const result = await sessionService.invalidateUserSessions(userId);
 
-      expect(mockPrisma.session.findMany).toHaveBeenCalledWith({
+      expect(result).toBe(2);
+      expect(mockPrisma.userSession.findMany).toHaveBeenCalledWith({
         where: { userId, isActive: true },
-        select: { id: true },
+        select: { sessionToken: true },
       });
-      expect(mockPrisma.session.updateMany).toHaveBeenCalledWith({
+      expect(mockPrisma.userSession.updateMany).toHaveBeenCalledWith({
         where: { userId, isActive: true },
         data: { isActive: false },
       });
-      expect(mockRedis.del).toHaveBeenCalledWith([
-        'refresh_token:session-1',
-        'refresh_token:session-2',
-      ]);
+    });
+
+    it('should invalidate user sessions excluding specific session', async () => {
+      const userId = 'user-123';
+      const excludeSessionId = 'session-to-keep';
+      const mockSessions = [
+        { sessionToken: 'session-1' },
+        { sessionToken: 'session-2' },
+      ];
+
+      mockPrisma.userSession.findMany.mockResolvedValue(mockSessions as any);
+      mockPrisma.userSession.updateMany.mockResolvedValue({ count: 2 });
+      mockRedis.del.mockResolvedValue(2);
+
+      const result = await sessionService.invalidateUserSessions(userId, excludeSessionId);
+
+      expect(result).toBe(2);
+      expect(mockPrisma.userSession.findMany).toHaveBeenCalledWith({
+        where: { userId, isActive: true, id: { not: excludeSessionId } },
+        select: { sessionToken: true },
+      });
     });
   });
 
@@ -337,51 +333,60 @@ describe('SessionService', () => {
         },
       ];
 
-      mockPrisma.session.findMany.mockResolvedValue(mockSessions as any);
+      mockPrisma.userSession.findMany.mockResolvedValue(mockSessions as any);
 
       const result = await sessionService.getUserSessions(userId);
 
       expect(result).toEqual(mockSessions);
-      expect(mockPrisma.session.findMany).toHaveBeenCalledWith({
-        where: { userId, isActive: true },
+      expect(mockPrisma.userSession.findMany).toHaveBeenCalledWith({
+        where: { userId, isActive: true, expiresAt: { gt: expect.any(Date) } },
         orderBy: { lastActivityAt: 'desc' },
       });
     });
 
-    it('should return empty array for user with no sessions', async () => {
-      const userId = 'user-with-no-sessions';
-      mockPrisma.session.findMany.mockResolvedValue([]);
+    it('should get all user sessions when activeOnly is false', async () => {
+      const userId = 'user-123';
+      const mockSessions = [
+        { id: 'session-1', userId, isActive: true },
+        { id: 'session-2', userId, isActive: false },
+      ];
 
-      const result = await sessionService.getUserSessions(userId);
+      mockPrisma.userSession.findMany.mockResolvedValue(mockSessions as any);
 
-      expect(result).toEqual([]);
+      const result = await sessionService.getUserSessions(userId, false);
+
+      expect(result).toEqual(mockSessions);
+      expect(mockPrisma.userSession.findMany).toHaveBeenCalledWith({
+        where: { userId },
+        orderBy: { lastActivityAt: 'desc' },
+      });
     });
   });
 
   describe('cleanupExpiredSessions', () => {
     it('should cleanup expired sessions', async () => {
       const expiredSessions = [
-        { id: 'session-1' },
-        { id: 'session-2' },
+        { sessionToken: 'session-1' },
+        { sessionToken: 'session-2' },
       ];
 
-      mockPrisma.session.findMany.mockResolvedValue(expiredSessions as any);
-      mockPrisma.session.deleteMany.mockResolvedValue({ count: 2 });
+      mockPrisma.userSession.findMany.mockResolvedValue(expiredSessions as any);
+      mockPrisma.userSession.deleteMany.mockResolvedValue({ count: 2 });
       mockRedis.del.mockResolvedValue(2);
 
       const result = await sessionService.cleanupExpiredSessions();
 
       expect(result).toBe(2);
-      expect(mockPrisma.session.findMany).toHaveBeenCalledWith({
+      expect(mockPrisma.userSession.findMany).toHaveBeenCalledWith({
         where: {
           OR: [
             { expiresAt: { lt: expect.any(Date) } },
             { isActive: false },
           ],
         },
-        select: { id: true },
+        select: { sessionToken: true },
       });
-      expect(mockPrisma.session.deleteMany).toHaveBeenCalledWith({
+      expect(mockPrisma.userSession.deleteMany).toHaveBeenCalledWith({
         where: {
           OR: [
             { expiresAt: { lt: expect.any(Date) } },
@@ -389,41 +394,54 @@ describe('SessionService', () => {
           ],
         },
       });
-      expect(mockRedis.del).toHaveBeenCalledWith([
-        'refresh_token:session-1',
-        'refresh_token:session-2',
-      ]);
     });
 
     it('should handle no expired sessions', async () => {
-      mockPrisma.session.findMany.mockResolvedValue([]);
-      mockPrisma.session.deleteMany.mockResolvedValue({ count: 0 });
+      mockPrisma.userSession.findMany.mockResolvedValue([]);
 
       const result = await sessionService.cleanupExpiredSessions();
 
       expect(result).toBe(0);
-      expect(mockRedis.del).not.toHaveBeenCalled();
+      expect(mockPrisma.userSession.deleteMany).not.toHaveBeenCalled();
     });
   });
 
-  describe('updateSessionActivity', () => {
-    it('should update session last activity', async () => {
-      const sessionId = 'session-123';
-      const mockSession = {
-        id: sessionId,
-        lastActivityAt: new Date(),
-      };
+  describe('getSessionStats', () => {
+    it('should get session statistics', async () => {
+      const mockUniqueUsers = [
+        { userId: 'user-1' },
+        { userId: 'user-2' },
+        { userId: 'user-3' },
+      ];
 
-      mockPrisma.session.update.mockResolvedValue(mockSession as any);
-      mockRedis.setex.mockResolvedValue('OK');
+      mockPrisma.userSession.count
+        .mockResolvedValueOnce(100) // total
+        .mockResolvedValueOnce(80) // active
+        .mockResolvedValueOnce(20); // expired
 
-      await sessionService.updateSessionActivity(sessionId);
+      mockPrisma.userSession.findMany.mockResolvedValue(mockUniqueUsers as any);
 
-      expect(mockPrisma.session.update).toHaveBeenCalledWith({
-        where: { id: sessionId },
-        data: { lastActivityAt: expect.any(Date) },
+      const result = await sessionService.getSessionStats();
+
+      expect(result).toEqual({
+        total: 100,
+        active: 80,
+        expired: 20,
+        uniqueUsers: 3,
       });
-      expect(mockRedis.setex).toHaveBeenCalled();
+    });
+
+    it('should handle database errors gracefully', async () => {
+      mockPrisma.userSession.count.mockRejectedValue(new Error('Database error'));
+
+      const result = await sessionService.getSessionStats();
+
+      expect(result).toEqual({
+        total: 0,
+        active: 0,
+        expired: 0,
+        uniqueUsers: 0,
+      });
     });
   });
 });
